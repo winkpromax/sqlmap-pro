@@ -32,13 +32,20 @@ def replace_host_in_request(request_content, new_host):
     Returns:
         str: Modified request content with replaced Host header
     """
+    # Replace {{Hostname}} placeholder if present (avoids regex group-ref issues)
+    if '{{Hostname}}' in request_content:
+        modified = request_content.replace('{{Hostname}}', new_host)
+        return modified
+
     # Match Host: xxx line (case-insensitive, supports spaces)
-    # Pattern matches: Host: xxx, host: xxx, HOST: xxx, etc.
+    # Use lambda to avoid "invalid group reference" when new_host starts with a digit (e.g. 8.x.x.x)
     pattern = r'(?i)^(Host:\s*).*$'
-    replacement = r'\1' + new_host
-    
-    modified = re.sub(pattern, replacement, request_content, flags=re.MULTILINE)
-    
+
+    def repl(m):
+        return m.group(1) + new_host
+
+    modified = re.sub(pattern, repl, request_content, flags=re.MULTILINE)
+
     # If Host header was not found, add it after the first line (request line)
     if modified == request_content:
         lines = request_content.split('\n')
@@ -110,6 +117,104 @@ def read_bulk_file(filepath):
         raise IOError(f"Error reading bulk file {filepath}: {e}")
 
 
+def analyze_sqlmap_output(output):
+    """
+    Analyze sqlmap output to determine if SQL injection was detected or database fingerprint was obtained.
+    
+    Args:
+        output (str): sqlmap output text
+    
+    Returns:
+        dict: Analysis results with keys: 'injection_detected', 'db_fingerprint', 'db_type', 'db_version'
+    """
+    result = {
+        'injection_detected': False,
+        'db_fingerprint': False,
+        'db_type': None,
+        'db_version': None
+    }
+    
+    output_lower = output.lower()
+    
+    # Check for SQL injection detection indicators (more specific patterns)
+    injection_indicators = [
+        r'parameter.*is.*injectable',  # "parameter 'id' is injectable"
+        r'is vulnerable',  # "is vulnerable"
+        r'payload:.*sql',  # "payload: SQL injection"
+        r'back-end dbms:.*\(injectable\)',  # "back-end DBMS: MySQL (injectable)"
+    ]
+    
+    # Check for injection detection
+    for pattern in injection_indicators:
+        if re.search(pattern, output_lower):
+            result['injection_detected'] = True
+            break
+    
+    # Check for database fingerprint indicators
+    # Look for "back-end DBMS:" or "database management system:" followed by DB type
+    db_patterns = {
+        'mysql': [
+            r'back-end dbms:\s*mysql',
+            r'database management system:\s*mysql',
+            r'the back-end dbms is mysql',
+        ],
+        'postgresql': [
+            r'back-end dbms:\s*postgresql',
+            r'database management system:\s*postgresql',
+            r'the back-end dbms is postgresql',
+        ],
+        'mssql': [
+            r'back-end dbms:\s*microsoft sql server',
+            r'back-end dbms:\s*mssql',
+            r'database management system:\s*microsoft sql server',
+            r'the back-end dbms is microsoft sql server',
+        ],
+        'oracle': [
+            r'back-end dbms:\s*oracle',
+            r'database management system:\s*oracle',
+            r'the back-end dbms is oracle',
+        ],
+        'sqlite': [
+            r'back-end dbms:\s*sqlite',
+            r'database management system:\s*sqlite',
+            r'the back-end dbms is sqlite',
+        ],
+        'access': [
+            r'back-end dbms:\s*microsoft access',
+            r'database management system:\s*microsoft access',
+            r'the back-end dbms is microsoft access',
+        ],
+    }
+    
+    # Check for database type
+    for db_type, patterns in db_patterns.items():
+        for pattern in patterns:
+            match = re.search(pattern, output_lower, re.IGNORECASE)
+            if match:
+                result['db_fingerprint'] = True
+                result['db_type'] = db_type
+                
+                # Try to extract version - look for "version is" or "version:" after DB type
+                # Pattern: "the back-end DBMS version is X.Y.Z" or "version: X.Y.Z"
+                version_patterns = [
+                    r'the back-end dbms version is\s*([\d.]+)',
+                    r'dbms version:\s*([\d.]+)',
+                    r'version:\s*([\d.]+)',
+                ]
+                
+                for vpattern in version_patterns:
+                    vmatch = re.search(vpattern, output_lower, re.IGNORECASE)
+                    if vmatch:
+                        result['db_version'] = vmatch.group(1)
+                        break
+                
+                break
+        if result['db_fingerprint']:
+            break
+    
+    return result
+
+
 def run_sqlmap(request_file, sqlmap_path, sqlmap_args):
     """
     Run sqlmap with the given request file and arguments.
@@ -120,22 +225,47 @@ def run_sqlmap(request_file, sqlmap_path, sqlmap_args):
         sqlmap_args (list): Additional arguments to pass to sqlmap
     
     Returns:
-        subprocess.CompletedProcess: Result of the subprocess call
+        tuple: (subprocess.CompletedProcess, dict) - Result and analysis dict
     """
     # Build command: python sqlmap.py -r <request_file> [other_args]
     cmd = [sys.executable, sqlmap_path, '-r', request_file] + sqlmap_args
     
     print(f"Running: {' '.join(cmd)}")
     
-    # Run sqlmap and show output in real-time
-    result = subprocess.run(
+    # Run sqlmap and capture output while showing it in real-time
+    process = subprocess.Popen(
         cmd,
-        stdout=sys.stdout,
-        stderr=sys.stderr,
-        text=True
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True
     )
     
-    return result
+    output_lines = []
+    # Read output line by line and display in real-time
+    for line in process.stdout:
+        print(line, end='', flush=True)
+        output_lines.append(line)
+    
+    # Wait for process to complete
+    returncode = process.wait()
+    
+    # Combine all output
+    output = ''.join(output_lines)
+    
+    # Analyze output
+    analysis = analyze_sqlmap_output(output)
+    
+    # Create a CompletedProcess-like object
+    result = subprocess.CompletedProcess(
+        cmd,
+        returncode,
+        output,
+        None
+    )
+    
+    return result, analysis
 
 
 def process_bulk_scan(bulk_file, request_template, sqlmap_path, sqlmap_args):
@@ -215,14 +345,34 @@ def process_bulk_scan(bulk_file, request_template, sqlmap_path, sqlmap_args):
             
             # Run sqlmap
             try:
-                result = run_sqlmap(temp_path, sqlmap_path, sqlmap_args)
+                result, analysis = run_sqlmap(temp_path, sqlmap_path, sqlmap_args)
                 
-                if result.returncode == 0:
-                    print(f"[+] Scan completed successfully for {target}")
+                # Only consider it successful if SQL injection was detected or database fingerprint was obtained
+                is_successful = analysis['injection_detected'] or analysis['db_fingerprint']
+                
+                if is_successful:
+                    db_info = ""
+                    if analysis['db_type']:
+                        db_info = f" (DB: {analysis['db_type']}"
+                        if analysis['db_version']:
+                            db_info += f" {analysis['db_version']}"
+                        db_info += ")"
+                    
+                    print(f"[+] SQL injection detected or database fingerprint obtained for {target}{db_info}")
                     stats['successful'] += 1
-                    successful_targets.append(target)  # 记录成功的资产
+                    # 记录成功的资产，包含数据库信息
+                    target_info = {
+                        'target': target,
+                        'injection_detected': analysis['injection_detected'],
+                        'db_type': analysis['db_type'],
+                        'db_version': analysis['db_version']
+                    }
+                    successful_targets.append(target_info)
                 else:
-                    print(f"[-] Scan failed for {target} (exit code: {result.returncode})")
+                    if result.returncode == 0:
+                        print(f"[-] Scan completed but no SQL injection detected for {target} (exit code: {result.returncode})")
+                    else:
+                        print(f"[-] Scan failed for {target} (exit code: {result.returncode})")
                     stats['failed'] += 1
             except KeyboardInterrupt:
                 print("\n[!] Interrupted by user")
@@ -370,8 +520,20 @@ def main():
             result_file = 'result.txt'
             try:
                 with open(result_file, 'w', encoding='utf-8') as f:
-                    for target in stats['successful_targets']:
-                        f.write(target + '\n')
+                    for target_info in stats['successful_targets']:
+                        # 如果是字典格式（包含数据库信息），格式化输出
+                        if isinstance(target_info, dict):
+                            line = target_info['target']
+                            if target_info.get('db_type'):
+                                line += f" | DB: {target_info['db_type']}"
+                                if target_info.get('db_version'):
+                                    line += f" {target_info['db_version']}"
+                            if target_info.get('injection_detected'):
+                                line += " | SQL Injection: Yes"
+                            f.write(line + '\n')
+                        else:
+                            # 兼容旧格式（字符串）
+                            f.write(str(target_info) + '\n')
                 print(f"\n[+] Successfully saved {len(stats['successful_targets'])} successful targets to {result_file}")
             except Exception as e:
                 print(f"\n[!] Warning: Could not write to {result_file}: {e}")
